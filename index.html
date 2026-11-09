@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>AR Угломер</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Импорт Three.js через unpkg -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: white; }
+        /* Контейнер для Three.js canvas */
+        #canvas-container { position: absolute; inset: 0; z-index: 0; }
+        
+        /* WebXR DOM Overlay требует, чтобы прозрачные области не перехватывали клики */
+        #dom-overlay { pointer-events: none; }
+        .pointer-auto { pointer-events: auto; }
+        
+        /* Стили для начального экрана */
+        #intro-screen { transition: opacity 0.3s; z-index: 50; }
+    </style>
+</head>
+<body>
+
+    <!-- Контейнер для 3D рендера -->
+    <div id="canvas-container"></div>
+
+    <!-- Начальный экран -->
+    <div id="intro-screen" class="absolute inset-0 bg-gray-900 flex flex-col items-center justify-center p-6 text-center">
+        <h1 class="text-3xl font-bold mb-4">AR Угломер 3D</h1>
+        <p class="text-gray-400 mb-8 max-w-md">
+            Приложение использует камеру и LiDAR (Hit-Test API) для распознавания поверхностей.
+        </p>
+        
+        <div id="error-message" class="hidden bg-red-900/50 border border-red-500 text-red-200 p-4 rounded-xl mb-6 max-w-md">
+            Ваш браузер не поддерживает WebXR AR. На iPhone используйте приложение "WebXR Viewer".
+        </div>
+
+        <button id="btn-start" class="hidden pointer-auto bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 px-8 rounded-full text-xl shadow-[0_0_20px_rgba(37,99,235,0.5)] transition-all">
+            Запустить AR сканер
+        </button>
+    </div>
+
+    <!-- DOM Overlay: интерфейс поверх камеры (виден только в AR) -->
+    <div id="dom-overlay" class="absolute inset-0 w-full h-full">
+        <div id="ar-ui" class="hidden flex-col h-full w-full justify-between p-6 pb-12">
+            
+            <!-- Верхняя панель (Инструкции и результат) -->
+            <div class="pointer-auto bg-gray-900/80 backdrop-blur-md border border-gray-700 rounded-2xl p-5 text-center shadow-xl">
+                <div id="instruction-text" class="text-blue-400 font-semibold text-sm uppercase tracking-wide mb-2">
+                    Поиск поверхностей...
+                </div>
+                <div id="angle-result" class="text-4xl font-bold text-white tracking-tighter hidden">
+                    0.0°
+                </div>
+                <div id="step-indicator" class="flex justify-center space-x-2 mt-3">
+                    <div class="w-3 h-3 rounded-full bg-gray-600" id="dot-1"></div>
+                    <div class="w-3 h-3 rounded-full bg-gray-600" id="dot-2"></div>
+                    <div class="w-3 h-3 rounded-full bg-gray-600" id="dot-3"></div>
+                </div>
+            </div>
+
+            <!-- Нижняя панель (Кнопка сброса) -->
+            <div class="flex justify-center pointer-auto">
+                <button id="btn-reset" class="bg-gray-800/80 backdrop-blur-md hover:bg-gray-700 border border-gray-600 text-white font-bold py-4 px-10 rounded-2xl shadow-lg transition-all flex items-center space-x-2">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                    </svg>
+                    <span>Сбросить точки</span>
+                </button>
+            </div>
+            
+        </div>
+    </div>
+
+    <!-- Основной скрипт Three.js и WebXR -->
+    <script type="module">
+        import * as THREE from 'three';
+
+        // Элементы DOM
+        const introScreen = document.getElementById('intro-screen');
+        const btnStart = document.getElementById('btn-start');
+        const errorMessage = document.getElementById('error-message');
+        const arUI = document.getElementById('ar-ui');
+        const btnReset = document.getElementById('btn-reset');
+        const instructionText = document.getElementById('instruction-text');
+        const angleResult = document.getElementById('angle-result');
+        const dots = [
+            document.getElementById('dot-1'),
+            document.getElementById('dot-2'),
+            document.getElementById('dot-3')
+        ];
+
+        // Глобальные переменные Three.js
+        let camera, scene, renderer;
+        let controller, reticle;
+        
+        // Переменные для Hit-Test
+        let hitTestSource = null;
+        let hitTestSourceRequested = false;
+
+        // Логика измерений
+        let points = []; // Массив THREE.Vector3 (макс 3)
+        let spheres = []; // Сферы (маркеры) на сцене
+        let lines = []; // Линии между точками
+
+        initThreeJS();
+        checkWebXR();
+
+        // 1. Инициализация базовой сцены Three.js
+        function initThreeJS() {
+            const container = document.getElementById('canvas-container');
+
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // Освещение (нужно для материалов маркеров)
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 3);
+            light.position.set(0.5, 1, 0.25);
+            scene.add(light);
+
+            // Рендерер
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true }); // alpha: true для камеры на фоне
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true; // Включаем WebXR
+            container.appendChild(renderer.domElement);
+
+            // Настройка прицела (Reticle)
+            const ringGeo = new THREE.RingGeometry(0.04, 0.05, 32).rotateX(-Math.PI / 2);
+            const ringMat = new THREE.MeshBasicMaterial({ color: 0x3b82f6 });
+            reticle = new THREE.Mesh(ringGeo, ringMat);
+            reticle.matrixAutoUpdate = false;
+            reticle.visible = false;
+            scene.add(reticle);
+
+            // Добавляем центральную точку к прицелу
+            const dotGeo = new THREE.CircleGeometry(0.005, 16).rotateX(-Math.PI / 2);
+            const dotMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const dotMesh = new THREE.Mesh(dotGeo, dotMat);
+            reticle.add(dotMesh);
+
+            // Настройка контроллера (тап по экрану)
+            controller = renderer.xr.getController(0);
+            controller.addEventListener('select', onSelect);
+            scene.add(controller);
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // 2. Проверка поддержки WebXR и AR
+        function checkWebXR() {
+            if ('xr' in navigator) {
+                navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+                    if (supported) {
+                        btnStart.style.display = 'block';
+                        btnStart.addEventListener('click', startARSession);
+                    } else {
+                        showError("Режим immersive-ar не поддерживается на этом устройстве.");
+                    }
+                });
+            } else {
+                showError("WebXR не поддерживается в вашем браузере. На iOS используйте приложение WebXR Viewer.");
+            }
+        }
+
+        function showError(msg) {
+            errorMessage.textContent = msg;
+            errorMessage.style.display = 'block';
+        }
+
+        // 3. Запуск AR сессии
+        function startARSession() {
+            const sessionInit = {
+                requiredFeatures: ['hit-test'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.getElementById('dom-overlay') }
+            };
+
+            navigator.xr.requestSession('immersive-ar', sessionInit).then((session) => {
+                session.addEventListener('end', onSessionEnded);
+                
+                // Убираем начальный экран
+                introScreen.style.display = 'none';
+                arUI.style.display = 'flex';
+                
+                updateUIState(); // Ставим правильный текст
+
+                // Запускаем сессию в рендерере
+                renderer.xr.setReferenceSpaceType('local');
+                renderer.xr.setSession(session);
+                
+                // Сброс состояния Hit Test
+                hitTestSourceRequested = false;
+                hitTestSource = null;
+
+                renderer.setAnimationLoop(render);
+            }).catch(err => {
+                alert("Ошибка запуска AR: " + err.message);
+            });
+        }
+
+        function onSessionEnded() {
+            introScreen.style.display = 'flex';
+            arUI.style.display = 'none';
+            resetMeasurement();
+            renderer.setAnimationLoop(null);
+        }
+
+        // 4. Обработка тапа по экрану (установка точки)
+        function onSelect() {
+            // Если прицел невидим (нет поверхности) или точек уже 3 - ничего не делаем
+            if (!reticle.visible || points.length >= 3) return;
+
+            // Получаем координаты из матрицы прицела
+            const position = new THREE.Vector3();
+            position.setFromMatrixPosition(reticle.matrix);
+
+            // Добавляем точку в массив
+            points.push(position.clone());
+
+            // Создаем маркер на сцене
+            const sphere = new THREE.Mesh(
+                new THREE.SphereGeometry(0.015, 16, 16),
+                new THREE.MeshBasicMaterial({ color: 0x10b981 }) // Изумрудный цвет
+            );
+            sphere.position.copy(position);
+            scene.add(sphere);
+            spheres.push(sphere);
+
+            // Рисуем линии
+            if (points.length === 2) {
+                // Линия 1 -> 2 (Стена -> Угол)
+                drawLine(points[0], points[1]);
+            } else if (points.length === 3) {
+                // Линия 2 -> 3 (Угол -> Стена)
+                drawLine(points[1], points[2]);
+                calculateAngle();
+            }
+
+            updateUIState();
+        }
+
+        // Рисование линии между двумя точками
+        function drawLine(pt1, pt2) {
+            const material = new THREE.LineBasicMaterial({ color: 0x10b981, linewidth: 4 });
+            const geometry = new THREE.BufferGeometry().setFromPoints([pt1, pt2]);
+            const line = new THREE.Line(geometry, material);
+            scene.add(line);
+            lines.push(line);
+        }
+
+        // 5. Математика: вычисление 3D угла в точке 2 (индекс 1)
+        function calculateAngle() {
+            // Вектор от угла (pt1) к первой точке (pt0)
+            const v1 = points[0].clone().sub(points[1]).normalize();
+            // Вектор от угла (pt1) ко второй стене (pt2)
+            const v2 = points[2].clone().sub(points[1]).normalize();
+
+            // Угол в радианах и перевод в градусы
+            const angleRad = v1.angleTo(v2);
+            const angleDeg = angleRad * (180 / Math.PI);
+
+            // Выводим на экран
+            angleResult.textContent = angleDeg.toFixed(1) + '°';
+        }
+
+        // 6. Обновление интерфейса
+        function updateUIState() {
+            // Сброс индикаторов
+            dots.forEach(d => d.className = "w-3 h-3 rounded-full bg-gray-600");
+            
+            for(let i=0; i<points.length; i++) {
+                dots[i].className = "w-3 h-3 rounded-full bg-green-500 shadow-[0_0_10px_rgba(16,185,129,0.8)]";
+            }
+
+            angleResult.style.display = 'none';
+            instructionText.style.display = 'block';
+
+            switch(points.length) {
+                case 0:
+                    instructionText.textContent = "Установите 1-ю точку на первой стене";
+                    break;
+                case 1:
+                    instructionText.textContent = "Установите 2-ю точку точно в угол (стык)";
+                    break;
+                case 2:
+                    instructionText.textContent = "Установите 3-ю точку на второй стене";
+                    break;
+                case 3:
+                    instructionText.style.display = 'none';
+                    angleResult.style.display = 'block';
+                    break;
+            }
+        }
+
+        // Кнопка сброса
+        btnReset.addEventListener('click', resetMeasurement);
+
+        function resetMeasurement() {
+            // Удаляем объекты со сцены
+            spheres.forEach(s => scene.remove(s));
+            lines.forEach(l => scene.remove(l));
+            
+            // Очищаем массивы
+            spheres = [];
+            lines = [];
+            points = [];
+            
+            updateUIState();
+        }
+
+        // 7. Основной цикл рендера (Hit Test)
+        function render(timestamp, frame) {
+            if (frame) {
+                const session = renderer.xr.getSession();
+                const referenceSpace = renderer.xr.getReferenceSpace();
+
+                // Запрос источника Hit Test (выполняется один раз за сессию)
+                if (hitTestSourceRequested === false) {
+                    session.requestReferenceSpace('viewer').then((viewerSpace) => {
+                        session.requestHitTestSource({ space: viewerSpace }).then((source) => {
+                            hitTestSource = source;
+                        });
+                    });
+                    session.addEventListener('end', () => {
+                        hitTestSourceRequested = false;
+                        hitTestSource = null;
+                    });
+                    hitTestSourceRequested = true;
+                }
+
+                // Обработка результатов Hit Test каждый кадр
+                if (hitTestSource) {
+                    const hitTestResults = frame.getHitTestResults(hitTestSource);
+
+                    if (hitTestResults.length > 0) {
+                        const hit = hitTestResults[0];
+                        const pose = hit.getPose(referenceSpace);
+
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(pose.transform.matrix);
+                        
+                        // Меняем цвет кольца, если 3 точки уже стоят (заблокировано)
+                        if (points.length >= 3) {
+                            reticle.material.color.setHex(0xef4444); // красный
+                        } else {
+                            reticle.material.color.setHex(0x3b82f6); // синий
+                        }
+                    } else {
+                        reticle.visible = false;
+                    }
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
